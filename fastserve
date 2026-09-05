@@ -23,10 +23,45 @@ import mimetypes
 import argparse
 import subprocess
 import shutil
+import ssl
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+
+CUSTOM_MIME_TYPES = {
+    '.iso': 'application/x-iso9660-image',
+    '.img': 'application/octet-stream',
+    '.dmg': 'application/x-apple-diskimage',
+    '.vmdk': 'application/octet-stream',
+    '.qcow2': 'application/octet-stream',
+    '.7z': 'application/x-7z-compressed',
+    '.rar': 'application/vnd.rar',
+    '.zst': 'application/zstd',
+    '.tar': 'application/x-tar',
+    '.zip': 'application/zip',
+    '.gz': 'application/gzip',
+    '.apk': 'application/vnd.android.package-archive',
+    '.bin': 'application/octet-stream',
+    '.exe': 'application/octet-stream',
+    '.msi': 'application/octet-stream'
+}
+
+def ensure_ssl_certificates():
+    cert_dir = os.path.expanduser("~/.fastserve")
+    os.makedirs(cert_dir, exist_ok=True)
+    cert_file = os.path.join(cert_dir, "cert.pem")
+    key_file = os.path.join(cert_dir, "key.pem")
+
+    if not os.path.exists(cert_file) or not os.path.exists(key_file):
+        cmd = [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_file, "-out", cert_file,
+            "-days", "3650", "-nodes",
+            "-subj", "/CN=FastServe LAN Transfer Server/O=FastServe/C=US"
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return cert_file, key_file
 # -----------------------------------------------------------------------------
 # 🌐 High-Accuracy Scanner-Verified Terminal QR Code Engine
 # -----------------------------------------------------------------------------
@@ -1052,10 +1087,12 @@ class FastServeHandler(BaseHTTPRequestHandler):
         sz_str = format_size(sz)
         icon = get_file_icon(ext)
         host = self.headers.get('Host', f"localhost:{self.server.server_port}")
-        dl_url = f"http://{host}/?download=1"
+        proto = "https" if getattr(FastServeHandler, "is_ssl", False) else "http"
+        dl_url = f"{proto}://{host}/?download=1"
+        k_flag = "-k " if getattr(FastServeHandler, "is_ssl", False) else ""
         
-        curl_cmd = f"curl -C - -O '{dl_url}'"
-        aria_cmd = f"aria2c -x 16 -s 16 '{dl_url}' -o '{fname}'"
+        curl_cmd = f"curl {k_flag}-C - -O '{dl_url}'"
+        aria_cmd = f"aria2c {k_flag}-x 16 -s 16 '{dl_url}' -o '{fname}'"
 
         content = f"""
         <div class="card-container">
@@ -1258,9 +1295,16 @@ class FastServeHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Archivo no encontrado")
             return
 
-        mime_type, _ = mimetypes.guess_type(file_path)
+        ext = os.path.splitext(file_path)[1].lower()
+        mime_type = CUSTOM_MIME_TYPES.get(ext)
+        if not mime_type:
+            mime_type, _ = mimetypes.guess_type(file_path)
         if not mime_type:
             mime_type = "application/octet-stream"
+
+        safe_ascii_name = re.sub(r'[^a-zA-Z0-9_\.\-]', '_', fname)
+        encoded_utf8_name = urllib.parse.quote(fname)
+        disp_header = f'attachment; filename="{safe_ascii_name}"; filename*=UTF-8\'\'{encoded_utf8_name}'
 
         range_header = self.headers.get("Range")
         if range_header:
@@ -1279,8 +1323,10 @@ class FastServeHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
                 self.send_header("Content-Length", str(content_length))
                 self.send_header("Accept-Ranges", "bytes")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-transform")
                 if as_attachment:
-                    self.send_header("Content-Disposition", f'attachment; filename="{urllib.parse.quote(fname)}"')
+                    self.send_header("Content-Disposition", disp_header)
                 self.end_headers()
 
                 try:
@@ -1302,8 +1348,10 @@ class FastServeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(file_size))
         self.send_header("Accept-Ranges", "bytes")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-transform")
         if as_attachment:
-            self.send_header("Content-Disposition", f'attachment; filename="{urllib.parse.quote(fname)}"')
+            self.send_header("Content-Disposition", disp_header)
         self.end_headers()
 
         try:
@@ -1324,11 +1372,12 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="⚡ FastServe - Servidor HTTP ultra-rápido de descarga y subida de archivos para red local.",
+        description="⚡ FastServe - Servidor HTTP/HTTPS ultra-rápido de transferencia de archivos para red local.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("target", nargs="?", default=".", help="Ruta al archivo o carpeta a servir (por defecto: carpeta actual).")
-    parser.add_argument("-p", "--port", type=int, default=8080, help="Puerto HTTP específico (por defecto: 8080).")
+    parser.add_argument("-p", "--port", type=int, default=None, help="Puerto específico (por defecto: 8443 con --ssl, 8080 en HTTP).")
+    parser.add_argument("-s", "--ssl", action="store_true", help="Habilitar cifrado HTTPS/SSL seguro (evita bloqueos de descarga en Windows).")
     parser.add_argument("--bind", default="0.0.0.0", help="Dirección IP de escucha (por defecto: 0.0.0.0).")
     parser.add_argument("--no-upload", action="store_true", help="Deshabilitar la subida de archivos (modo solo lectura).")
     
@@ -1340,13 +1389,19 @@ def main():
         sys.exit(1)
 
     is_dir = os.path.isdir(target_path)
+    is_ssl = args.ssl
     FastServeHandler.root_path = target_path if is_dir else os.path.dirname(target_path)
     FastServeHandler.is_single_file = not is_dir
     FastServeHandler.single_file_path = target_path if not is_dir else None
     FastServeHandler.allow_upload = not args.no_upload
+    FastServeHandler.is_ssl = is_ssl
 
-    # Encontrar puerto libre
-    port = args.port
+    # Determinar puerto base
+    if args.port is not None:
+        port = args.port
+    else:
+        port = 8443 if is_ssl else 8080
+
     server = None
     for attempt_port in range(port, port + 50):
         try:
@@ -1357,12 +1412,26 @@ def main():
             continue
 
     if not server:
-        print(f"❌ Error: No se pudo abrir ningún puerto entre {args.port} y {args.port + 50}.")
+        print(f"❌ Error: No se pudo abrir ningún puerto entre {port} y {port + 50}.")
         sys.exit(1)
 
+    scheme = "http"
+    if is_ssl:
+        try:
+            cert_file, key_file = ensure_ssl_certificates()
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+            scheme = "https"
+        except Exception as e:
+            print(f"⚠️ Advertencia: No se pudo inicializar SSL ({e}). Iniciando en modo HTTP normal.")
+            is_ssl = False
+            FastServeHandler.is_ssl = False
+            scheme = "http"
+
     lan_ip = get_lan_ip()
-    local_url = f"http://localhost:{port}"
-    lan_url = f"http://{lan_ip}:{port}"
+    local_url = f"{scheme}://localhost:{port}"
+    lan_url = f"{scheme}://{lan_ip}:{port}"
 
     print("\n" + "=" * 64)
     print("⚡ FastServe - Servidor de Transferencia Directa LAN (Descargas & Subidas)")
@@ -1374,11 +1443,18 @@ def main():
         sz_str = format_size(os.path.getsize(target_path))
         print(f"💿 Archivo Individual : {os.path.basename(target_path)} ({sz_str})")
 
+    if is_ssl:
+        print(f"🔐 Seguridad TLS/SSL  : HABILITADO (HTTPS Cifrado Anti-Bloqueo de Navegador)")
+    else:
+        print(f"🔓 Seguridad HTTP     : Sin cifrado (Usa -s o --ssl para HTTPS si Windows bloquea descargas)")
+
     print(f"🏠 Acceso Local       : {local_url}")
     print(f"🌐 Acceso Red (LAN)   : {lan_url}")
     print("=" * 64)
     print_qr_terminal(lan_url)
     print("=" * 64)
+    if is_ssl:
+        print("💡 Nota: Al abrir en Chrome/Brave, pulsa 'Configuración avanzada -> Acceder a la IP (no seguro)' para autorizar el certificado LAN.\n")
     print("🚀 Servidor listo. Presiona Ctrl+C para detener.\n")
     sys.stdout.flush()
 
