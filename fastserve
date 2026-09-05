@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-⚡ FastServe - Universal High-Speed LAN File Server & Downloader CLI
-===================================================================
+⚡ FastServe - Universal High-Speed LAN File Server, Downloader & Uploader CLI
+=============================================================================
 Pure Python standard library (Zero External Dependencies).
 - RFC 7233 High-Speed Byte-Range Streaming (Multi-GB ISOs, ZIPs, Datasets).
+- High-Speed Chunked Streaming Uploads (Drag & Drop + File Explorer Picker).
+- Real-time Live Upload Telemetry (Speed MB/s, Progress %, ETA, Multi-file Queue).
 - Modern Glassmorphic Web UI with Folder Navigation, Search, and File Previews.
 - Instant 1-Click Terminal Copy Commands (curl, aria2c, wget).
-- Pure-Python Terminal QR Code for Mobile File Sharing.
-- Drag & Drop Upload Mode (Optional with --upload).
+- Pure-Python Terminal Banner & LAN IP Auto-detection.
 """
 
 import os
 import sys
+import re
 import time
+import json
 import socket
 import urllib.parse
 import mimetypes
 import argparse
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # -----------------------------------------------------------------------------
-# 🌐 Terminal QR Code Generator (Pure Python Standard Library)
+# 🌐 Network & System Utilities
 # -----------------------------------------------------------------------------
 def generate_qr_matrix(data_str):
-    # Fallback to compact ASCII block box if pure-QR generator isn't loaded
-    # Or create high-contrast terminal representation
     lines = [
         " ┌────────────────────────────────────────┐ ",
         f" │  🔗 ESCANEA O ABRE EN TU NAVEGADOR     │ ",
@@ -75,12 +75,12 @@ def get_file_icon(ext, is_dir=False):
         return "📄"
     elif ext in ['.py', '.sh', '.js', '.ts', '.html', '.css', '.json', '.c', '.cpp', '.rs', '.go']:
         return "💻"
-    elif ext in ['.exe', '.bin', '.app', '.deb', '.rpm', '.apk']:
+    elif ext in ['.exe', '.bin', '.app', '.deb', '.rpm', '.apk', '.msi']:
         return "⚙️"
     return "📎"
 
 # -----------------------------------------------------------------------------
-# 🎨 Modern Glassmorphic Web UI HTML Template
+# 🎨 Modern Glassmorphic Web UI HTML Template (with Drag & Drop Uploads)
 # -----------------------------------------------------------------------------
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="es">
@@ -98,8 +98,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             --card-border: rgba(255, 255, 255, 0.08);
             --hover-bg: rgba(30, 41, 59, 0.7);
             --primary: #3b82f6;
-            --primary-glow: rgba(59, 130, 246, 0.25);
+            --primary-glow: rgba(59, 130, 246, 0.3);
             --accent: #10b981;
+            --accent-glow: rgba(16, 185, 129, 0.3);
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
             --font-main: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -123,11 +124,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             min-height: 100vh;
             display: flex;
             flex-direction: column;
+            position: relative;
         }
 
         header {
-            padding: 24px 32px;
-            background: rgba(15, 23, 42, 0.6);
+            padding: 20px 32px;
+            background: rgba(15, 23, 42, 0.65);
             backdrop-filter: blur(16px);
             -webkit-backdrop-filter: blur(16px);
             border-bottom: 1px solid var(--card-border);
@@ -172,9 +174,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             text-transform: uppercase;
         }
 
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            max-width: 540px;
+            width: 100%;
+            justify-content: flex-end;
+        }
+
         .search-box {
             position: relative;
-            max-width: 380px;
+            max-width: 320px;
             width: 100%;
         }
 
@@ -214,11 +225,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             padding: 32px 24px;
         }
 
+        .top-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 24px;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
         .breadcrumbs {
             display: flex;
             align-items: center;
             gap: 8px;
-            margin-bottom: 24px;
             font-size: 14px;
             font-weight: 500;
             color: var(--text-muted);
@@ -362,6 +381,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             transform: translateY(-1px);
         }
 
+        .btn-accent {
+            background: var(--accent);
+            color: #fff;
+            box-shadow: 0 4px 12px var(--accent-glow);
+        }
+
+        .btn-accent:hover {
+            background: #059669;
+            transform: translateY(-1px);
+        }
+
         .btn-secondary {
             background: rgba(51, 65, 85, 0.6);
             color: #cbd5e1;
@@ -371,6 +401,131 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-secondary:hover {
             background: rgba(71, 85, 105, 0.8);
             color: #fff;
+        }
+
+        /* Drag and drop overlay */
+        #dropOverlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(9, 13, 22, 0.88);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            z-index: 9999;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s ease;
+            border: 4px dashed var(--accent);
+            margin: 16px;
+            border-radius: 20px;
+        }
+
+        #dropOverlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .drop-icon {
+            font-size: 80px;
+            animation: bounce 1.2s infinite ease-in-out;
+        }
+
+        .drop-text {
+            font-size: 26px;
+            font-weight: 800;
+            color: #fff;
+        }
+
+        .drop-sub {
+            font-size: 15px;
+            color: var(--text-muted);
+        }
+
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-15px); }
+        }
+
+        /* Upload Progress Modal / Floating Card */
+        #uploadProgressCard {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%) translateY(150px);
+            width: 90%;
+            max-width: 520px;
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            border-radius: 16px;
+            padding: 20px 24px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            opacity: 0;
+            transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        #uploadProgressCard.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
+
+        .upload-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .upload-fname {
+            font-size: 15px;
+            font-weight: 700;
+            color: #f8fafc;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 320px;
+        }
+
+        .upload-stats {
+            font-size: 13px;
+            font-family: var(--font-mono);
+            font-weight: 600;
+            color: #60a5fa;
+        }
+
+        .progress-bar-bg {
+            width: 100%;
+            height: 10px;
+            background: rgba(30, 41, 59, 0.8);
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #3b82f6, #10b981);
+            border-radius: 10px;
+            transition: width 0.15s ease;
+        }
+
+        .upload-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 12px;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
         }
 
         .toast {
@@ -471,6 +626,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 gap: 16px;
                 padding: 16px;
             }
+            .header-actions {
+                max-width: 100%;
+                justify-content: space-between;
+            }
             .search-box {
                 max-width: 100%;
             }
@@ -494,9 +653,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="brand-title">FastServe</span>
             <span class="brand-tag">v{{VERSION}}</span>
         </a>
-        <div class="search-box">
-            <span class="search-icon">🔍</span>
-            <input type="text" id="searchInput" class="search-input" placeholder="Buscar archivo..." oninput="filterFiles()">
+        <div class="header-actions">
+            <div class="search-box">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="searchInput" class="search-input" placeholder="Buscar archivo..." oninput="filterFiles()">
+            </div>
+            {{UPLOAD_BUTTON}}
         </div>
     </header>
 
@@ -508,12 +670,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         FastServe • Servidor de Transferencia Directa LAN a Velocidad Gigabit • Soporte RFC 7233
     </footer>
 
+    <!-- Drag and Drop Full Screen Overlay -->
+    <div id="dropOverlay">
+        <div class="drop-icon">📥</div>
+        <div class="drop-text">Suelta los archivos aquí</div>
+        <div class="drop-sub">Se subirán directamente a esta carpeta en la máquina anfitriona</div>
+    </div>
+
+    <!-- Hidden Native File Input -->
+    <input type="file" id="fileUploadInput" multiple style="display: none;" onchange="handleFileSelect(event)">
+
+    <!-- Upload Progress Floating Card -->
+    <div id="uploadProgressCard">
+        <div class="upload-header">
+            <span id="uploadFileName" class="upload-fname">subiendo_archivo.iso</span>
+            <span id="uploadPercentage" class="upload-stats">0%</span>
+        </div>
+        <div class="progress-bar-bg">
+            <div id="progressBarFill" class="progress-bar-fill"></div>
+        </div>
+        <div class="upload-footer">
+            <span id="uploadSpeed">⚡ 0.0 MB/s</span>
+            <span id="uploadProgressBytes">0 MB / 0 MB</span>
+        </div>
+    </div>
+
     <div id="toast" class="toast">
-        <span>📋</span>
+        <span id="toastIcon">📋</span>
         <span id="toastMsg">Copiado al portapapeles</span>
     </div>
 
     <script>
+        const CURRENT_DIR_REL = "{{CURRENT_REL_DIR}}";
+
         function filterFiles() {
             const query = document.getElementById('searchInput').value.toLowerCase();
             const items = document.querySelectorAll('.file-item');
@@ -533,11 +722,133 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        function showToast(msg) {
+        function showToast(msg, icon) {
             const t = document.getElementById('toast');
             document.getElementById('toastMsg').innerText = msg;
+            document.getElementById('toastIcon').innerText = icon || '📋';
             t.classList.add('show');
-            setTimeout(() => t.classList.remove('show'), 2500);
+            setTimeout(() => t.classList.remove('show'), 3000);
+        }
+
+        // -------------------------------------------------------------
+        // 📤 High-Speed Chunked Upload Client Logic
+        // -------------------------------------------------------------
+        let uploadQueue = [];
+        let isUploading = false;
+
+        function triggerFilePicker() {
+            document.getElementById('fileUploadInput').click();
+        }
+
+        function handleFileSelect(e) {
+            const files = Array.from(e.target.files);
+            if (files.length > 0) {
+                enqueueFiles(files);
+            }
+            e.target.value = '';
+        }
+
+        // Drag and Drop Events
+        window.addEventListener('dragenter', (e) => {
+            e.preventDefault();
+            document.getElementById('dropOverlay').classList.add('active');
+        });
+
+        window.addEventListener('dragover', (e) => {
+            e.preventDefault();
+        });
+
+        document.getElementById('dropOverlay').addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            document.getElementById('dropOverlay').classList.remove('active');
+        });
+
+        document.getElementById('dropOverlay').addEventListener('drop', (e) => {
+            e.preventDefault();
+            document.getElementById('dropOverlay').classList.remove('active');
+            if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+                enqueueFiles(Array.from(e.dataTransfer.files));
+            }
+        });
+
+        function enqueueFiles(files) {
+            uploadQueue.push(...files);
+            if (!isUploading) {
+                processNextUpload();
+            }
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        function processNextUpload() {
+            if (uploadQueue.length === 0) {
+                isUploading = false;
+                const card = document.getElementById('uploadProgressCard');
+                setTimeout(() => card.classList.remove('show'), 1500);
+                return;
+            }
+
+            isUploading = true;
+            const file = uploadQueue.shift();
+            const card = document.getElementById('uploadProgressCard');
+            card.classList.add('show');
+
+            document.getElementById('uploadFileName').innerText = `📤 ${file.name} (${uploadQueue.length > 0 ? '+' + uploadQueue.length + ' en cola' : ''})`;
+            document.getElementById('progressBarFill').style.width = '0%';
+            document.getElementById('uploadPercentage').innerText = '0%';
+            document.getElementById('uploadSpeed').innerText = '⚡ Calculando...';
+
+            const url = `/api/upload?dir=${encodeURIComponent(CURRENT_DIR_REL)}&filename=${encodeURIComponent(file.name)}`;
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', url, true);
+
+            let startTime = Date.now();
+            let lastLoaded = 0;
+            let lastTime = startTime;
+
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    document.getElementById('progressBarFill').style.width = percent + '%';
+                    document.getElementById('uploadPercentage').innerText = percent + '%';
+                    document.getElementById('uploadProgressBytes').innerText = `${formatBytes(e.loaded)} / ${formatBytes(e.total)}`;
+
+                    const now = Date.now();
+                    const timeDiff = (now - lastTime) / 1000;
+                    if (timeDiff >= 0.5) {
+                        const bytesDiff = e.loaded - lastLoaded;
+                        const speedBps = bytesDiff / timeDiff;
+                        document.getElementById('uploadSpeed').innerText = `⚡ ${formatBytes(speedBps)}/s`;
+                        lastLoaded = e.loaded;
+                        lastTime = now;
+                    }
+                }
+            };
+
+            xhr.onload = () => {
+                if (xhr.status === 200) {
+                    showToast(`Subido con éxito: ${file.name}`, '✅');
+                    setTimeout(() => {
+                        processNextUpload();
+                    }, 400);
+                } else {
+                    showToast(`Error al subir ${file.name}: ${xhr.statusText}`, '❌');
+                    processNextUpload();
+                }
+            };
+
+            xhr.onerror = () => {
+                showToast(`Fallo de conexión al subir ${file.name}`, '❌');
+                processNextUpload();
+            };
+
+            xhr.send(file);
         }
     </script>
 </body>
@@ -545,12 +856,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 # -----------------------------------------------------------------------------
-# 🚀 FastServe HTTP Request Handler with Full Byte-Range Support
+# 🚀 FastServe HTTP Request Handler (Byte-Range + Streaming Uploads)
 # -----------------------------------------------------------------------------
 class FastServeHandler(BaseHTTPRequestHandler):
     root_path = os.getcwd()
     is_single_file = False
     single_file_path = None
+    allow_upload = True
 
     def send_safe_header(self, keyword, value):
         try:
@@ -559,15 +871,72 @@ class FastServeHandler(BaseHTTPRequestHandler):
             pass
 
     def log_message(self, format, *args):
-        pass # Silent logging for maximum I/O performance
+        pass # Silent logging for maximum transfer throughput
 
     def get_real_path(self, url_path):
         parsed = urllib.parse.unquote(url_path).lstrip('/')
         target = os.path.abspath(os.path.join(self.root_path, parsed))
-        # Jail security check
         if not target.startswith(self.root_path):
             return None
         return target
+
+    def do_POST(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        
+        # 📤 API de Subida Directa de Archivos en Streaming (0 RAM overhead)
+        if parsed_url.path == "/api/upload":
+            if not self.allow_upload or self.is_single_file:
+                self.send_error(403, "Subidas no permitidas en este modo")
+                return
+
+            query = urllib.parse.parse_qs(parsed_url.query)
+            rel_dir = query.get("dir", ["."])[0]
+            raw_filename = query.get("filename", [None])[0]
+
+            if not raw_filename:
+                self.send_error(400, "Parámetro filename requerido")
+                return
+
+            safe_filename = os.path.basename(urllib.parse.unquote(raw_filename))
+            target_dir = self.get_real_path(rel_dir)
+            if not target_dir or not os.path.isdir(target_dir):
+                self.send_error(400, "Directorio destino inválido")
+                return
+
+            final_dest = os.path.join(target_dir, safe_filename)
+            tmp_dest = final_dest + f".fastserve_{int(time.time())}.tmp"
+
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                remaining = content_length
+                
+                with open(tmp_dest, "wb") as f:
+                    while remaining > 0:
+                        chunk_size = min(remaining, 128 * 1024)
+                        data = self.rfile.read(chunk_size)
+                        if not data:
+                            break
+                        f.write(data)
+                        remaining -= len(data)
+
+                if os.path.exists(tmp_dest):
+                    os.replace(tmp_dest, final_dest)
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                resp = json.dumps({"success": True, "filename": safe_filename, "size": os.path.getsize(final_dest)})
+                self.wfile.write(resp.encode("utf-8"))
+            except Exception as e:
+                if os.path.exists(tmp_dest):
+                    try:
+                        os.remove(tmp_dest)
+                    except Exception:
+                        pass
+                self.send_error(500, f"Error durante la subida: {e}")
+            return
+
+        self.send_error(404)
 
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
@@ -635,7 +1004,13 @@ class FastServeHandler(BaseHTTPRequestHandler):
             </div>
         </div>
         """
-        html = HTML_TEMPLATE.replace("{{TITLE}}", fname).replace("{{CONTENT}}", content).replace("{{VERSION}}", VERSION)
+        html = (HTML_TEMPLATE
+                .replace("{{TITLE}}", fname)
+                .replace("{{CONTENT}}", content)
+                .replace("{{UPLOAD_BUTTON}}", "")
+                .replace("{{CURRENT_REL_DIR}}", ".")
+                .replace("{{VERSION}}", VERSION))
+
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(html.encode('utf-8'))))
@@ -690,7 +1065,6 @@ class FastServeHandler(BaseHTTPRequestHandler):
             else:
                 files_list.append(item_data)
 
-        # Sort: Directories first, then files
         all_items = dirs_list + files_list
         items_html = []
 
@@ -749,10 +1123,27 @@ class FastServeHandler(BaseHTTPRequestHandler):
                 """)
 
         if not all_items and rel_path == ".":
-            items_html.append('<div style="padding: 40px; text-align: center; color: var(--text-muted);">Esta carpeta está vacía.</div>')
+            items_html.append('<div style="padding: 40px; text-align: center; color: var(--text-muted);">Esta carpeta está vacía. Puedes arrastrar archivos aquí para subirlos.</div>')
+
+        upload_btn_html = ""
+        if self.allow_upload:
+            upload_btn_html = """
+            <button class="btn btn-accent" onclick="triggerFilePicker()">
+                📤 Subir Archivo(s)
+            </button>
+            """
+
+        top_bar = f"""
+        <div class="top-bar">
+            {breadcrumbs}
+            <div style="font-size: 13px; color: var(--text-muted);">
+                💡 Puedes arrastrar y soltar archivos en cualquier lugar de esta ventana para subirlos
+            </div>
+        </div>
+        """
 
         content = f"""
-        {breadcrumbs}
+        {top_bar}
         <div class="card-container">
             <div class="toolbar">
                 <span>NOMBRE DEL ARCHIVO</span>
@@ -765,7 +1156,12 @@ class FastServeHandler(BaseHTTPRequestHandler):
         </div>
         """
         title = os.path.basename(dir_path) if rel_path != "." else "Directorio Compartido"
-        html = HTML_TEMPLATE.replace("{{TITLE}}", title).replace("{{CONTENT}}", content).replace("{{VERSION}}", VERSION)
+        html = (HTML_TEMPLATE
+                .replace("{{TITLE}}", title)
+                .replace("{{CONTENT}}", content)
+                .replace("{{UPLOAD_BUTTON}}", upload_btn_html)
+                .replace("{{CURRENT_REL_DIR}}", rel_path)
+                .replace("{{VERSION}}", VERSION))
         
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -847,12 +1243,13 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="⚡ FastServe - Servidor HTTP ultra-rápido de distribución de archivos para red local.",
+        description="⚡ FastServe - Servidor HTTP ultra-rápido de descarga y subida de archivos para red local.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("target", nargs="?", default=".", help="Ruta al archivo o carpeta a servir (por defecto: carpeta actual).")
     parser.add_argument("-p", "--port", type=int, default=8080, help="Puerto HTTP específico (por defecto: 8080).")
     parser.add_argument("--bind", default="0.0.0.0", help="Dirección IP de escucha (por defecto: 0.0.0.0).")
+    parser.add_argument("--no-upload", action="store_true", help="Deshabilitar la subida de archivos (modo solo lectura).")
     
     args = parser.parse_args()
 
@@ -865,6 +1262,7 @@ def main():
     FastServeHandler.root_path = target_path if is_dir else os.path.dirname(target_path)
     FastServeHandler.is_single_file = not is_dir
     FastServeHandler.single_file_path = target_path if not is_dir else None
+    FastServeHandler.allow_upload = not args.no_upload
 
     # Encontrar puerto libre
     port = args.port
@@ -886,10 +1284,11 @@ def main():
     lan_url = f"http://{lan_ip}:{port}"
 
     print("\n" + "=" * 64)
-    print("⚡ FastServe - Servidor de Transferencia Directa LAN")
+    print("⚡ FastServe - Servidor de Transferencia Directa LAN (Descargas & Subidas)")
     print("=" * 64)
     if is_dir:
         print(f"📁 Carpeta Compartida : {target_path}")
+        print(f"📤 Subidas Web (Upload): {'HABILITADAS (Drag & Drop activo)' if not args.no_upload else 'DESHABILITADAS (Solo lectura)'}")
     else:
         sz_str = format_size(os.path.getsize(target_path))
         print(f"💿 Archivo Individual : {os.path.basename(target_path)} ({sz_str})")
