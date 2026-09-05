@@ -29,6 +29,7 @@ VERSION = "1.1.0"
 # -----------------------------------------------------------------------------
 # 🌐 Pure Python Reed-Solomon GF(256) Terminal QR Code Engine
 # -----------------------------------------------------------------------------
+# Pure Python Reed-Solomon GF(256) Terminal QR Code Engine (Canonical Proven Implementation)
 class PureTerminalQR:
     EXP = [1] * 512
     LOG = [0] * 256
@@ -171,7 +172,7 @@ class PureTerminalQR:
             if not reserved[i][8]: reserved[8][i] = True
         for i in range(size - 8, size):
             if not reserved[8][i]: reserved[8][i] = True
-            if not reserved[i][8]: reserved[8][i] = True
+            if not reserved[i][8]: reserved[i][8] = True
 
         bit_idx = 0
         r, c = size - 1, size - 1
